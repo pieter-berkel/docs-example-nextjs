@@ -1,36 +1,159 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+Create an new page for adding Drizzle ORM (database).
+The original documentation is available at: #fetch https://orm.drizzle.team/
 
-## Getting Started
+In most cases I use MySQL as the database, this is the example I will use.
 
-First, run the development server:
+- Use soft deletes with the `deletedAt` column.
+
+## Installation
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm add nanoid drizzle-orm mysql2
+pnpm add -D drizzle-kit dotenv
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Setup nanoid for ID generation
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Add the following code to `/utils/nanoid.ts`:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```typescript
+import { customAlphabet } from "nanoid";
 
-## Learn More
+const alpabet = "0123456789abcdefghijklmnopqrstuvwxyz";
+export const nanoid = customAlphabet(alpabet, 16);
+```
 
-To learn more about Next.js, take a look at the following resources:
+Add a new environment variable in your `.env` file:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```.env
+DATABASE_URL=mysql://user:password@localhost:3306/database_name
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+Create a file `drizzle.config.ts` in the root of your project:
 
-## Deploy on Vercel
+```typescript
+import "dotenv/config";
+import { defineConfig } from "drizzle-kit";
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+export default defineConfig({
+  out: "./drizzle",
+  schema: "./lib/db/schema",
+  dialect: "mysql",
+  dbCredentials: {
+    url: process.env.DATABASE_URL!,
+  },
+});
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Add 2 new scripts to your `package.json`:
+
+```json
+{
+  "scripts": {
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio"
+  }
+}
+```
+
+Add the following code to `lib/db/index.ts`:
+
+```typescript
+import { drizzle, MySql2Database } from "drizzle-orm/mysql2";
+import mysql, { Pool } from "mysql2/promise";
+import * as schema from "./schema/index";
+
+let database: MySql2Database<typeof schema>;
+let connection: Pool;
+
+if (process.env.NODE_ENV === "production") {
+  connection = mysql.createPool(process.env.DATABASE_URL as string);
+  database = drizzle(connection, { schema, mode: "default" });
+} else {
+  if (!(global as any).database) {
+    connection = mysql.createPool(process.env.DATABASE_URL as string);
+    (global as any).database = drizzle(connection, { schema, mode: "default" });
+  }
+  database = (global as any).database;
+}
+
+export * from "drizzle-orm/sql";
+export { database, connection, schema };
+```
+
+Add the following code to `lib/db/helpers.ts`:
+
+```typescript title="lib/db/helpers.ts"
+import { timestamp, varchar } from "drizzle-orm/mysql-core";
+
+import { nanoid } from "@/utils/nanoid";
+
+export const id = varchar("id", { length: 16 })
+  .primaryKey()
+  .$defaultFn(() => nanoid());
+
+export const createdAt = timestamp("created_at").notNull().defaultNow();
+
+export const updatedAt = timestamp("updated_at")
+  .notNull()
+  .defaultNow()
+  .onUpdateNow();
+
+export const deletedAt = timestamp("deleted_at");
+
+export const timestamps = {
+  createdAt,
+  updatedAt,
+  deletedAt,
+};
+```
+
+Tables can be created with the following strucure for example:
+
+```typescript title="lib/db/schema/todo-items.ts"
+import { boolean, mysqlTable as table, varchar } from "drizzle-orm/mysql-core";
+
+import { id, timestamps } from "../helpers";
+
+export const todoItems = table("todo_items", {
+  id,
+  title: varchar("title", { length: 255 }).notNull(),
+  isCompleted: boolean("is_completed").notNull().default(false),
+  ...timestamps,
+});
+```
+
+Re-export the schema in `lib/db/schema/index.ts`:
+
+```typescript title="lib/db/schema/index.ts"
+export * from "./todo-items";
+```
+
+Example when selecting data:
+
+```typescript
+import { database, schema, isNull } from "@/lib/db";
+
+// with releations api
+const items = await database.query.todoItems.findMany({
+  where: (todoItems, { eq }) => eq(todoItems.deletedAt, null),
+});
+
+// with select api
+const items = await database
+  .select()
+  .from(schema.todoItems)
+  .where(isNull(schema.todoItems.deletedAt));
+```
+
+Example when deleting data:
+
+```typescript
+import { database, schema } from "@/lib/db";
+
+// soft delete
+await database
+  .update(schema.todoItems)
+  .set({ deletedAt: new Date() })
+  .where(eq(schema.todoItems.id, "x"));
+```
